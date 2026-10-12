@@ -137,7 +137,8 @@ class PostHogWidgetState extends State<PostHogWidget> {
     // of the app, leaving the next session's recording blank.
     if (!occluded) {
       printIfDebug(
-          'Native occlusion ended (episode $episode): resuming Flutter capture.');
+        'Native occlusion ended (episode $episode): resuming Flutter capture.',
+      );
       _setSuppressFlutterCapture(false);
       _screenshotCapturer?.onOcclusionEnded();
       // Without a sample here the replay would stay on the episode's last frame
@@ -151,8 +152,10 @@ class PostHogWidgetState extends State<PostHogWidget> {
     }
     if (!replayConfig.captureNativeScreens) {
       // Fail open in case the bridge was toggled off mid-episode.
-      printIfDebug('Native occlusion started (episode $episode): '
-          'captureNativeScreens is off, keeping Flutter capture.');
+      printIfDebug(
+        'Native occlusion started (episode $episode): '
+        'captureNativeScreens is off, keeping Flutter capture.',
+      );
       _setSuppressFlutterCapture(false);
       return;
     }
@@ -161,19 +164,22 @@ class PostHogWidgetState extends State<PostHogWidget> {
     if (!bridgeFailed) {
       final accepted =
           await _nativeCommunicator?.enableNativeBridge(episode: episode) ??
-              false;
+          false;
       if (_disposed ||
           !PostHogInternalEvents.episodeStillCurrent(episode, occluded: true)) {
         return;
       }
       if (accepted) {
-        printIfDebug('Native occlusion started (episode $episode): '
-            'bridged to native capture.');
+        printIfDebug(
+          'Native occlusion started (episode $episode): '
+          'bridged to native capture.',
+        );
         return;
       }
     }
     printIfDebug(
-        'Native occlusion started (episode $episode): emitting placeholder.');
+      'Native occlusion started (episode $episode): emitting placeholder.',
+    );
     final imageInfo = await _screenshotCapturer?.buildOcclusionPlaceholder();
     if (imageInfo != null && !_disposed) {
       // A placeholder is only valid while its own episode is occluding.
@@ -189,8 +195,10 @@ class PostHogWidgetState extends State<PostHogWidget> {
   /// the session, so a stale frame would land in the new session ahead of the
   /// meta event that session has not sent yet.
   bool _stillValid(ImageInfo imageInfo, int episode, {required bool occluded}) {
-    return PostHogInternalEvents.episodeStillCurrent(episode,
-            occluded: occluded) &&
+    return PostHogInternalEvents.episodeStillCurrent(
+          episode,
+          occluded: occluded,
+        ) &&
         (_screenshotCapturer?.sessionStillCurrent(imageInfo) ?? false);
   }
 
@@ -306,9 +314,18 @@ class PostHogWidgetState extends State<PostHogWidget> {
     if (_disposed || !isStillValid()) {
       return false;
     }
+    // Palima patch: debug offline mode never sends anything to the native SDK.
+    if (PostHogReplayDebug.offline) {
+      _screenshotCapturer?.confirmDelivered(
+        imageInfo.id,
+        metaSent: imageInfo.shouldSendMetaEvent,
+      );
+      return true;
+    }
     if (imageInfo.shouldSendMetaEvent) {
       _screenshotCapturer?.rearmMetaEvent(imageInfo.id);
-      final metaSent = await _nativeCommunicator?.sendMetaEvent(
+      final metaSent =
+          await _nativeCommunicator?.sendMetaEvent(
             width: imageInfo.width,
             height: imageInfo.height,
             screen: Posthog().currentScreen,
@@ -319,7 +336,8 @@ class PostHogWidgetState extends State<PostHogWidget> {
       }
     }
 
-    final snapshotSent = await _nativeCommunicator?.sendFullSnapshot(
+    final snapshotSent =
+        await _nativeCommunicator?.sendFullSnapshot(
           imageInfo.imageBytes,
           id: imageInfo.id,
           x: imageInfo.x,

@@ -84,6 +84,7 @@ class _PlatformViewRects {
 }
 
 class ScreenshotCapturer {
+  String _debugComposite = '';
   final PostHogConfig _config;
 
   /// Called when a capture tick reads a session id different from the one it
@@ -273,11 +274,13 @@ class ScreenshotCapturer {
   /// Null when a view that must be masked could not be measured; the caller
   /// drops the frame rather than ship it unmasked.
   _PlatformViewRects? _collectPlatformViewRects(
-      PostHogPlatformViewPrivacy defaultPolicy,
-      [RenderObject? ancestorOverride]) {
+    PostHogPlatformViewPrivacy defaultPolicy, [
+    RenderObject? ancestorOverride,
+  ]) {
     final masked = <ElementData>[];
     final captured = <_CapturedView>[];
-    final ancestor = ancestorOverride ??
+    final ancestor =
+        ancestorOverride ??
         PostHogMaskController.instance.containerKey.currentContext
             ?.findRenderObject();
     final seen = <int>{};
@@ -285,13 +288,20 @@ class ScreenshotCapturer {
     final rootElement = WidgetsBinding.instance.rootElement;
     if (rootElement != null &&
         !_visitElementForPlatformViews(
-            rootElement, ancestor, masked, captured, seen, defaultPolicy)) {
+          rootElement,
+          ancestor,
+          masked,
+          captured,
+          seen,
+          defaultPolicy,
+        )) {
       return null;
     }
 
     if (masked.isNotEmpty || captured.isNotEmpty) {
       printIfDebug(
-          'Found ${masked.length} masked and ${captured.length} captured platform view rect(s)');
+        'Found ${masked.length} masked and ${captured.length} captured platform view rect(s)',
+      );
     }
     return _PlatformViewRects(masked: masked, captured: captured);
   }
@@ -316,7 +326,13 @@ class ScreenshotCapturer {
     }
     element.visitChildren((child) {
       if (!_visitElementForPlatformViews(
-          child, ancestor, masked, captured, seen, policy)) {
+        child,
+        ancestor,
+        masked,
+        captured,
+        seen,
+        policy,
+      )) {
         safe = false;
       }
     });
@@ -344,20 +360,24 @@ class ScreenshotCapturer {
       final visible = clippedPaintBounds(ro, ancestor);
       if (visible.isEmpty) return true;
       if (policy == PostHogPlatformViewPrivacy.capture) {
-        captured.add(_CapturedView(
-          data: ElementData(
-            rect: ro.paintBounds,
+        captured.add(
+          _CapturedView(
+            data: ElementData(
+              rect: ro.paintBounds,
+              type: 'platformView',
+              transform: transform,
+            ),
+            visibleRect: visible,
+          ),
+        );
+      } else {
+        masked.add(
+          ElementData(
+            rect: visible,
             type: 'platformView',
             transform: transform,
           ),
-          visibleRect: visible,
-        ));
-      } else {
-        masked.add(ElementData(
-          rect: visible,
-          type: 'platformView',
-          transform: transform,
-        ));
+        );
       }
       return true;
     } catch (e) {
@@ -373,32 +393,40 @@ class ScreenshotCapturer {
   /// check the fallback covers only the visible region.
   @visibleForTesting
   Future<void> debugMaskFailedCapture(
-          Canvas canvas, Rect viewRect, Rect visibleRect, Matrix4 transform) =>
-      _compositeRevealedView(
-        canvas,
-        _CapturedView(
-          data: ElementData(
-              rect: viewRect, type: 'platformView', transform: transform),
-          visibleRect: visibleRect,
-        ),
-        null,
-        0,
-        0,
-        1.0,
-      );
+    Canvas canvas,
+    Rect viewRect,
+    Rect visibleRect,
+    Matrix4 transform,
+  ) => _compositeRevealedView(
+    canvas,
+    _CapturedView(
+      data: ElementData(
+        rect: viewRect,
+        type: 'platformView',
+        transform: transform,
+      ),
+      visibleRect: visibleRect,
+    ),
+    null,
+    0,
+    0,
+    1.0,
+  );
 
   /// The rects the mask painter is handed for the platform views on screen,
   /// and the visible region each revealed view is clipped to.
   @visibleForTesting
   ({List<Rect> masked, List<Rect> revealed})? debugPlatformViewRects(
-          PostHogPlatformViewPrivacy defaultPolicy) =>
-      debugPlatformViewRectsAgainst(defaultPolicy, null);
+    PostHogPlatformViewPrivacy defaultPolicy,
+  ) => debugPlatformViewRectsAgainst(defaultPolicy, null);
 
   /// As [debugPlatformViewRects], but measured against [ancestor] so a test can
   /// force the walk to fail.
   @visibleForTesting
   ({List<Rect> masked, List<Rect> revealed})? debugPlatformViewRectsAgainst(
-      PostHogPlatformViewPrivacy defaultPolicy, RenderObject? ancestor) {
+    PostHogPlatformViewPrivacy defaultPolicy,
+    RenderObject? ancestor,
+  ) {
     final rects = _collectPlatformViewRects(defaultPolicy, ancestor);
     if (rects == null) return null;
     return (
@@ -425,8 +453,9 @@ class ScreenshotCapturer {
     Uint8List? bytes,
     int nativeW,
     int nativeH,
-    double pixelRatio,
-  ) async {
+    double pixelRatio, {
+    bool neutralFallback = false,
+  }) async {
     final viewRect = view.data;
     final transform = viewRect.transform;
     if (transform == null) return;
@@ -443,6 +472,19 @@ class ScreenshotCapturer {
       final message =
           '$reason a platform view at ${viewRect.rect}; masked it instead.$hint';
       if (_loggedDeclines.add(message)) printIfDebug(message);
+      if (neutralFallback) {
+        // Palima patch: the view sits UNDER the Flutter content, so a neutral
+        // grey keeps the interface drawn above it readable.
+        canvas.save();
+        canvas.scale(pixelRatio);
+        canvas.transform(transform.storage);
+        canvas.drawRect(
+          view.visibleRect,
+          Paint()..color = const Color(0xFFD9D9D9),
+        );
+        canvas.restore();
+        return;
+      }
       _imageMaskPainter.drawMaskedImage(canvas, [fallbackMask], pixelRatio);
     }
 
@@ -499,8 +541,11 @@ class ScreenshotCapturer {
 
     if (bytes.offsetInBytes % 4 == 0) {
       final wordCount = length ~/ 4;
-      final words =
-          Uint32List.view(bytes.buffer, bytes.offsetInBytes, wordCount);
+      final words = Uint32List.view(
+        bytes.buffer,
+        bytes.offsetInBytes,
+        wordCount,
+      );
       for (var i = 0; i < wordCount; i++) {
         hash ^= words[i];
         hash = (hash * 0x01000193) & 0x7fffffff;
@@ -527,7 +572,8 @@ class ScreenshotCapturer {
     ViewTreeSnapshotStatus statusView,
     bool shouldSendMetaEvent,
     Offset globalPosition,
-  })? _resolveCaptureTarget() {
+  })?
+  _resolveCaptureTarget() {
     _cancelled = false;
 
     final context = PostHogMaskController.instance.containerKey.currentContext;
@@ -646,7 +692,9 @@ class ScreenshotCapturer {
     // Cleared again in _resolveCaptureTarget, but that runs after the round trip
     // below — whose post-await check would veto this capture on a prior flag.
     _cancelled = false;
-    final state = await _nativeCommunicator.getSessionReplayState();
+    final state = PostHogReplayDebug.offline
+        ? (isActive: true, sessionId: 'debug-offline')
+        : await _nativeCommunicator.getSessionReplayState();
     if (_cancelled) {
       return null;
     }
@@ -709,13 +757,19 @@ class ScreenshotCapturer {
         // Fail closed: a failed walk must drop the frame, never ship an
         // unmasked screenshot.
         if (maskElements == null) {
-          printIfDebug(
-            'The widget mask walk failed, dropping the frame.',
-          );
+          printIfDebug('The widget mask walk failed, dropping the frame.');
           completer.complete(null);
           return;
         }
 
+        // Palima patch: record, from the same frame, only the Flutter layers
+        // painted ABOVE the first platform view (bottom sheets, buttons…). The
+        // regular toImage() paints what lies BELOW the view (scaffold
+        // background) into the view's hole, which would hide a native
+        // background drawn first.
+        LayerSegments? segments = replayConfig.maskAllPlatformViews
+            ? null
+            : recordLayerSegments(renderObject, pixelRatio);
         image = await renderObject.toImage(pixelRatio: pixelRatio);
 
         final currentImage = image;
@@ -809,11 +863,87 @@ class ScreenshotCapturer {
           return;
         }
 
-        try {
-          canvas.drawImage(currentImage, Offset.zero, Paint());
-        } finally {
+        final sw = Stopwatch()..start();
+        var nativeMs = 0;
+        final underFirst = hasCapturedViews && segments != null;
+        if (underFirst) {
+          // Palima patch: re-composite the frame in paint order. Flutter
+          // content below each platform view, then the native capture of that
+          // view (or a neutral grey), then what Flutter paints above it; masks
+          // come last. Platform views that are not revealed get no pixels.
           currentImage.dispose();
           image = null;
+          final specs = pvRects.captured
+              .map((v) => _viewSpec(v.data, globalPosition))
+              .toList();
+          final nsw = Stopwatch()..start();
+          final bytesList = await _nativeCommunicator.captureNativeScreenshots(
+            specs,
+          );
+          nativeMs = nsw.elapsedMilliseconds;
+          if (_cancelled) {
+            segments.dispose();
+            currentRecorder.endRecording().dispose();
+            recorder = null;
+            completer.complete(null);
+            return;
+          }
+          final deviceRects = pvRects.captured.map((v) {
+            final t = v.data.transform;
+            if (t == null) return Rect.zero;
+            final r = MatrixUtils.transformRect(t, v.data.rect);
+            return Rect.fromLTRB(
+              r.left * pixelRatio,
+              r.top * pixelRatio,
+              r.right * pixelRatio,
+              r.bottom * pixelRatio,
+            );
+          }).toList();
+          final drawn = <int>{};
+          for (var s = 0; s < segments.pictures.length; s++) {
+            canvas.drawPicture(segments.pictures[s]);
+            if (s >= segments.markers.length) break;
+            final m = segments.markers[s];
+            for (var i = 0; i < deviceRects.length; i++) {
+              if (drawn.contains(i)) continue;
+              final d = deviceRects[i];
+              final tol = 3 * pixelRatio + 2;
+              if ((d.left - m.left).abs() <= tol &&
+                  (d.top - m.top).abs() <= tol &&
+                  (d.width - m.width).abs() <= tol &&
+                  (d.height - m.height).abs() <= tol) {
+                drawn.add(i);
+                final spec = specs[i];
+                final bytes = i < bytesList.length ? bytesList[i] : null;
+                await _compositeRevealedView(
+                  canvas,
+                  pvRects.captured[i],
+                  bytes,
+                  spec['width']!,
+                  spec['height']!,
+                  pixelRatio,
+                  neutralFallback: true,
+                );
+                break;
+              }
+            }
+          }
+          if (PostHogReplayDebug.onComposedFrame != null)
+            _debugComposite =
+                'markers=${segments.markers.map((r) => '${r.left.round()},${r.top.round()},${r.width.round()}x${r.height.round()}').join('|')} '
+                'views=${deviceRects.map((r) => '${r.left.round()},${r.top.round()},${r.width.round()}x${r.height.round()}').join('|')} '
+                'matched=${drawn.toList()} bytes=${bytesList.map((b) => b == null ? 0 : 1).toList()}';
+          segments.dispose();
+          segments = null;
+        } else {
+          segments?.dispose();
+          segments = null;
+          try {
+            canvas.drawImage(currentImage, Offset.zero, Paint());
+          } finally {
+            currentImage.dispose();
+            image = null;
+          }
         }
 
         if (_cancelled) {
@@ -824,26 +954,19 @@ class ScreenshotCapturer {
         }
 
         if (maskElements.isNotEmpty) {
-          _imageMaskPainter.drawMaskedImage(
-            canvas,
-            maskElements,
-            pixelRatio,
-          );
+          _imageMaskPainter.drawMaskedImage(canvas, maskElements, pixelRatio);
         }
 
         if (pvRects.masked.isNotEmpty) {
-          _imageMaskPainter.drawMaskedImage(
-            canvas,
-            pvRects.masked,
-            pixelRatio,
-          );
+          _imageMaskPainter.drawMaskedImage(canvas, pvRects.masked, pixelRatio);
         }
-        if (pvRects.captured.isNotEmpty) {
+        if (!underFirst && pvRects.captured.isNotEmpty) {
           final specs = pvRects.captured
               .map((v) => _viewSpec(v.data, globalPosition))
               .toList();
-          final bytesList =
-              await _nativeCommunicator.captureNativeScreenshots(specs);
+          final bytesList = await _nativeCommunicator.captureNativeScreenshots(
+            specs,
+          );
           if (_cancelled) {
             currentRecorder.endRecording().dispose();
             recorder = null;
@@ -853,8 +976,14 @@ class ScreenshotCapturer {
           for (var i = 0; i < pvRects.captured.length; i++) {
             final spec = specs[i];
             final bytes = i < bytesList.length ? bytesList[i] : null;
-            await _compositeRevealedView(canvas, pvRects.captured[i], bytes,
-                spec['width']!, spec['height']!, pixelRatio);
+            await _compositeRevealedView(
+              canvas,
+              pvRects.captured[i],
+              bytes,
+              spec['width']!,
+              spec['height']!,
+              pixelRatio,
+            );
           }
         }
 
@@ -892,6 +1021,17 @@ class ScreenshotCapturer {
             if (_cancelled || pngBytes == null || pngBytes.isEmpty) {
               completer.complete(null);
               return;
+            }
+            final debugHook = PostHogReplayDebug.onComposedFrame;
+            if (debugHook != null) {
+              try {
+                debugHook(
+                  pngBytes,
+                  'views=${pvRects.captured.length} underFirst=$underFirst '
+                  'native=${nativeMs}ms compose+png=${sw.elapsedMilliseconds}ms '
+                  '${currentFinalImage.width}x${currentFinalImage.height} $_debugComposite',
+                );
+              } catch (_) {}
             }
 
             if (hasCapturedViews) {
@@ -1095,4 +1235,217 @@ PostHogPlatformViewPrivacy resolvePrivacyPolicyForElement(
     return (element.widget as PostHogPlatformView).privacy;
   }
   return inherited;
+}
+
+/// Palima patch (replay_carte_1210): the Flutter frame of a render object
+/// split at its platform views. `pictures[i]` is what Flutter paints between
+/// platform view `i - 1` and platform view `i` (in paint order), and
+/// `markers[i]` the device-pixel rect of platform view `i`;
+/// `pictures.length == markers.length + 1`.
+class LayerSegments {
+  final List<ui.Picture> pictures;
+  final List<Rect> markers;
+  LayerSegments(this.pictures, this.markers);
+
+  void dispose() {
+    for (final p in pictures) {
+      p.dispose();
+    }
+    pictures.clear();
+  }
+}
+
+/// Records [renderObject]'s layer tree split at each [PlatformViewLayer],
+/// scaled by [pixelRatio]. Returns null when there is no platform view layer
+/// or when the layer tree cannot be read. Must be called synchronously next to
+/// `toImage()` so both come from the same frame. Texture, backdrop-filter and
+/// shader-mask effects are approximated (children drawn without the effect).
+LayerSegments? recordLayerSegments(
+  RenderObject renderObject,
+  double pixelRatio,
+) {
+  // ignore: invalid_use_of_protected_member
+  final root = renderObject.layer;
+  if (root == null) return null;
+  final w = _SegmentWalker(pixelRatio);
+  try {
+    var child = root.firstChild;
+    while (child != null) {
+      w.paint(child);
+      child = child.nextSibling;
+    }
+  } catch (e) {
+    printIfDebug('Could not record the layer segments: $e');
+    w.finish().dispose();
+    return null;
+  }
+  final result = w.finish();
+  if (result.markers.isEmpty) {
+    result.dispose();
+    return null;
+  }
+  return result;
+}
+
+class _SegmentWalker {
+  _SegmentWalker(this.pixelRatio) {
+    _start();
+  }
+
+  final double pixelRatio;
+  final pictures = <ui.Picture>[];
+  final markers = <Rect>[];
+  // Canvas state to replay when a new segment starts, outermost first.
+  final _ops = <void Function(Canvas)>[];
+  late ui.PictureRecorder _recorder;
+  late Canvas _canvas;
+
+  void _start() {
+    _recorder = ui.PictureRecorder();
+    _canvas = Canvas(_recorder);
+    _canvas.scale(pixelRatio);
+    for (final op in _ops) {
+      op(_canvas);
+    }
+  }
+
+  void _cut(Rect deviceRect) {
+    pictures.add(_recorder.endRecording());
+    markers.add(deviceRect);
+    _start();
+  }
+
+  LayerSegments finish() {
+    pictures.add(_recorder.endRecording());
+    return LayerSegments(pictures, markers);
+  }
+
+  void _push(void Function(Canvas) op) {
+    _ops.add(op);
+    op(_canvas);
+  }
+
+  void _pop() {
+    _ops.removeLast();
+    _canvas.restore();
+  }
+
+  void paint(Layer layer) {
+    if (layer is PlatformViewLayer) {
+      final m = Matrix4.fromFloat64List(_canvas.getTransform());
+      _cut(MatrixUtils.transformRect(m, layer.rect));
+      return;
+    }
+    if (layer is PictureLayer) {
+      final picture = layer.picture;
+      if (picture != null) _canvas.drawPicture(picture);
+      return;
+    }
+    if (layer is! ContainerLayer) return; // texture, performance overlay…
+
+    if (layer is FollowerLayer) {
+      if (layer.link.leader == null && layer.showWhenUnlinked != true) return;
+    }
+    if (layer is OpacityLayer && (layer.alpha ?? 255) == 0) return;
+
+    // Each op opens exactly one save level (save or saveLayer).
+    void Function(Canvas)? op;
+    if (layer is TransformLayer) {
+      final offset = layer.offset;
+      final t = layer.transform;
+      op = (c) {
+        c.save();
+        if (offset != Offset.zero) c.translate(offset.dx, offset.dy);
+        if (t != null) c.transform(t.storage);
+      };
+    } else if (layer is OpacityLayer) {
+      final offset = layer.offset;
+      final alpha = layer.alpha ?? 255;
+      op = (c) {
+        if (alpha < 255) {
+          c.saveLayer(null, Paint()..color = Color.fromARGB(alpha, 0, 0, 0));
+        } else {
+          c.save();
+        }
+        c.translate(offset.dx, offset.dy);
+      };
+    } else if (layer is ImageFilterLayer) {
+      final offset = layer.offset;
+      final f = layer.imageFilter;
+      op = (c) {
+        if (f != null) {
+          c.saveLayer(null, Paint()..imageFilter = f);
+        } else {
+          c.save();
+        }
+        c.translate(offset.dx, offset.dy);
+      };
+    } else if (layer is OffsetLayer) {
+      final offset = layer.offset;
+      op = (c) {
+        c.save();
+        c.translate(offset.dx, offset.dy);
+      };
+    } else if (layer is FollowerLayer) {
+      final unlinked = layer.unlinkedOffset ?? Offset.zero;
+      final t = layer.getLastTransform();
+      op = (c) {
+        c.save();
+        c.translate(unlinked.dx, unlinked.dy);
+        if (t != null) c.transform(t.storage);
+      };
+    } else if (layer is LeaderLayer) {
+      final offset = layer.offset;
+      op = (c) {
+        c.save();
+        c.translate(offset.dx, offset.dy);
+      };
+    } else if (layer is ClipRectLayer) {
+      final r = layer.clipRect;
+      final b = layer.clipBehavior;
+      op = (c) {
+        c.save();
+        if (r != null && b != Clip.none) {
+          c.clipRect(r, doAntiAlias: b != Clip.hardEdge);
+        }
+      };
+    } else if (layer is ClipRRectLayer) {
+      final r = layer.clipRRect;
+      final b = layer.clipBehavior;
+      op = (c) {
+        c.save();
+        if (r != null && b != Clip.none) {
+          c.clipRRect(r, doAntiAlias: b != Clip.hardEdge);
+        }
+      };
+    } else if (layer is ClipPathLayer) {
+      final p = layer.clipPath;
+      final b = layer.clipBehavior;
+      op = (c) {
+        c.save();
+        if (p != null && b != Clip.none) {
+          c.clipPath(p, doAntiAlias: b != Clip.hardEdge);
+        }
+      };
+    } else if (layer is ColorFilterLayer) {
+      final f = layer.colorFilter;
+      op = (c) {
+        if (f != null) {
+          c.saveLayer(null, Paint()..colorFilter = f);
+        } else {
+          c.save();
+        }
+      };
+    } else {
+      op = (c) => c.save();
+    }
+
+    _push(op);
+    var child = layer.firstChild;
+    while (child != null) {
+      paint(child);
+      child = child.nextSibling;
+    }
+    _pop();
+  }
 }

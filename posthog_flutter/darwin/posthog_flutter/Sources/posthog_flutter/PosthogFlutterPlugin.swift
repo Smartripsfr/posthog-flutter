@@ -793,7 +793,71 @@ extension PosthogFlutterPlugin {
                     return
                 }
 
-                // No WKWebView found for the captured rect. Returning nil here
+                // Palima patch (replay_carte_1210): any other platform view (Mapbox
+                // MapView, Metal-backed) that the capture rect fully covers is drawn
+                // with drawHierarchy on THAT view only (never the whole window), so a
+                // neighbouring masked view can still not leak into the replay.
+                // Refuse when another platform view overlaps the rect (it may be a
+                // masked one, and drawHierarchy of a parent would leak it).
+                // Containment is tested on the REQUESTED rect: a view larger than the
+                // screen (Souvenirs globe) is not contained in the window-clipped crop.
+                let requested = CGRect(x: x, y: y, width: width, height: height)
+                if let pv = self.findPlatformView(in: window, containedBy: requested),
+                   self.countPlatformViews(in: window, intersecting: cropRect) == 1
+                {
+                    // The whole requested view, even its off-screen part: Dart decodes
+                    // the buffer at the requested size and maps it onto the full view rect.
+                    let local = pv.convert(requested, from: nil).intersection(pv.bounds)
+                    guard !local.isNull, !local.isEmpty else {
+                        onResult(nil)
+                        return
+                    }
+                    // Cost guard: a full-screen Metal map is redrawn by drawHierarchy at
+                    // most every minNativeCaptureInterval per rect; in between the last
+                    // good capture is reused (the replay keeps the 500 ms Flutter cadence).
+                    let cacheKey = "\(Int(cropRect.minX)),\(Int(cropRect.minY)),\(Int(cropRect.width)),\(Int(cropRect.height))"
+                    let now = CACurrentMediaTime()
+                    if let last = Self.lastPlatformViewCaptureTime[cacheKey],
+                       now - last < Self.minNativeCaptureInterval,
+                       let cached = Self.lastGoodPlatformViewCapture[cacheKey]
+                    {
+                        onResult(FlutterStandardTypedData(bytes: cached))
+                        return
+                    }
+                    Self.lastPlatformViewCaptureTime[cacheKey] = now
+                    let format = UIGraphicsImageRendererFormat()
+                    format.scale = 1
+                    format.opaque = true
+                    let renderer = UIGraphicsImageRenderer(size: local.size, format: format)
+                    let drawRect = CGRect(x: -local.origin.x, y: -local.origin.y,
+                                          width: pv.bounds.width, height: pv.bounds.height)
+                    func render(_ afterUpdates: Bool) -> Data? {
+                        var drawn = false
+                        let image = renderer.image { _ in
+                            drawn = pv.drawHierarchy(in: drawRect, afterScreenUpdates: afterUpdates)
+                        }
+                        guard drawn, let raw = self.imageToRawRgba(image) else { return nil }
+                        return Self.isUniform(raw) ? nil : raw
+                    }
+                    let key = "\(Int(cropRect.minX)),\(Int(cropRect.minY)),\(Int(cropRect.width)),\(Int(cropRect.height))"
+                    // A Metal view (Mapbox) can come back uniform (black before its first
+                    // drawable, white/plain for a transparent globe): retry once with
+                    // afterScreenUpdates, then never ship it — reuse the last good capture
+                    // of the same rect, else let Dart paint its neutral grey.
+                    guard let raw = render(false) ?? render(true) else {
+                        onResult(Self.lastGoodPlatformViewCapture[key].map(FlutterStandardTypedData.init(bytes:)))
+                        return
+                    }
+                    if Self.lastGoodPlatformViewCapture.count > 8 {
+                        Self.lastGoodPlatformViewCapture.removeAll()
+                        Self.lastPlatformViewCaptureTime.removeAll()
+                    }
+                    Self.lastGoodPlatformViewCapture[key] = raw
+                    onResult(FlutterStandardTypedData(bytes: raw))
+                    return
+                }
+
+                // No capturable view found for the captured rect. Returning nil here
                 // keeps this safe: drawHierarchy over the full window would
                 // include any masked CALayer-backed platform view overlapping
                 // the crop region and leak it into replay.
@@ -852,6 +916,71 @@ extension PosthogFlutterPlugin {
             })
                 ?? windows.first(where: \.isKeyWindow)
                 ?? UIApplication.shared.windows.first
+        }
+
+        private static var lastGoodPlatformViewCapture: [String: Data] = [:]
+        private static var lastPlatformViewCaptureTime: [String: CFTimeInterval] = [:]
+        /// Seconds between two drawHierarchy captures of the same platform view.
+        static var minNativeCaptureInterval: CFTimeInterval = 2.0
+
+        /// True when (almost) every sampled pixel has the same colour as the first
+        /// one: an all-black (Metal before its first drawable) or all-white/plain
+        /// (transparent Metal layer not captured) image (RGBA buffer).
+        private static func isUniform(_ data: Data) -> Bool {
+            let n = data.count / 4
+            guard n > 0 else { return true }
+            let step = max(1, n / 2000)
+            var different = 0
+            var samples = 0
+            data.withUnsafeBytes { (buf: UnsafeRawBufferPointer) in
+                // Reference = centre pixel: corners can be clipped (rounded views).
+                let c = (n / 2) * 4
+                let r0 = Int(buf[c]), g0 = Int(buf[c + 1]), b0 = Int(buf[c + 2])
+                var i = 0
+                while i < n {
+                    let o = i * 4
+                    if abs(Int(buf[o]) - r0) + abs(Int(buf[o + 1]) - g0) + abs(Int(buf[o + 2]) - b0) > 24 {
+                        different += 1
+                    }
+                    samples += 1
+                    i += step
+                }
+            }
+            return different * 100 < samples * 3 // < 3 % of pixels differ
+        }
+
+        private func countPlatformViews(in view: UIView, intersecting rect: CGRect) -> Int {
+            var count = 0
+            if NSStringFromClass(type(of: view)).contains("FlutterTouchInterceptingView"),
+               !view.isHidden, view.alpha > 0.01
+            {
+                let frameInWindow = view.convert(view.bounds, to: nil)
+                if frameInWindow.intersects(rect.insetBy(dx: 1, dy: 1)) { count += 1 }
+                return count // a platform view never nests another one
+            }
+            for sub in view.subviews {
+                count += countPlatformViews(in: sub, intersecting: rect)
+            }
+            return count
+        }
+
+        /// Palima patch: the outermost Flutter platform-view container
+        /// (FlutterTouchInterceptingView) whose frame lies inside [rect].
+        private func findPlatformView(in view: UIView, containedBy rect: CGRect) -> UIView? {
+            if NSStringFromClass(type(of: view)).contains("FlutterTouchInterceptingView"),
+               !view.isHidden, view.alpha > 0.01
+            {
+                let frameInWindow = view.convert(view.bounds, to: nil)
+                if rect.insetBy(dx: -1, dy: -1).contains(frameInWindow) {
+                    return view
+                }
+            }
+            for sub in view.subviews {
+                if let found = findPlatformView(in: sub, containedBy: rect) {
+                    return found
+                }
+            }
+            return nil
         }
 
         private func findWKWebView(in view: UIView, containedBy rect: CGRect) -> WKWebView? {

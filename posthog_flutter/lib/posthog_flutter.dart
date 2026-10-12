@@ -14,3 +14,4 @@ export 'src/replay/mask/posthog_mask_widget.dart' hide PostHogMaskWidgetState;
 export 'src/replay/mask/posthog_unmask_widget.dart';
 export 'src/replay/mask/posthog_platform_view.dart';
 export 'src/replay/mask/posthog_text_mask.dart';
+export 'src/replay/replay_debug.dart';
